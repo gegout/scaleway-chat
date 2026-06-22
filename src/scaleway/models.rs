@@ -117,6 +117,7 @@ pub struct ServerTypesResponse {
 #[derive(Debug, Deserialize, Clone)]
 pub struct ServerTypeDetails {
     pub volumes_constraint: Option<VolumesConstraint>,
+    pub arch: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Clone)]

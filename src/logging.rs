@@ -21,7 +21,7 @@
 
 use tracing_subscriber::{fmt, EnvFilter};
 
-pub fn init(verbose: bool) {
+pub fn init(verbose: bool, to_stderr: bool) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         if verbose {
             EnvFilter::new("scaleway_chat=debug")
@@ -30,9 +30,14 @@ pub fn init(verbose: bool) {
         }
     });
 
-    fmt()
+    let builder = fmt()
         .with_env_filter(filter)
         .with_target(false)
-        .without_time()
-        .init();
+        .without_time();
+
+    if to_stderr {
+        builder.with_writer(std::io::stderr).init();
+    } else {
+        builder.init();
+    }
 }

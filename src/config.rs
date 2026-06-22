@@ -51,9 +51,23 @@ pub struct ScalewayConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct InstanceConfig {
     pub name: String,
+    #[serde(default)]
     pub instance_type: String,
     pub snapshot_id: String,
     pub public_ip: String,
+    pub gpu_types: Option<Vec<String>>,
+}
+
+impl InstanceConfig {
+    pub fn effective_gpu_types(&self) -> Vec<String> {
+        if let Some(ref gpus) = self.gpu_types {
+            gpus.clone()
+        } else if !self.instance_type.trim().is_empty() {
+            vec![self.instance_type.clone()]
+        } else {
+            vec![]
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -72,6 +86,14 @@ pub struct TimeoutsConfig {
     pub instance_poll_interval_seconds: u64,
     pub nemotron_startup_seconds: u64,
     pub nemotron_poll_interval_seconds: u64,
+    pub cleanup_timeout_seconds: u64,
+    pub cleanup_poll_interval_seconds: u64,
+    #[serde(default = "default_inference_timeout")]
+    pub inference_timeout_seconds: u64,
+}
+
+fn default_inference_timeout() -> u64 {
+    300
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -139,10 +161,25 @@ impl Config {
                 "instance name cannot be empty".to_string(),
             ));
         }
-        if self.instance.instance_type.trim().is_empty() {
+        let effective_gpus = self.instance.effective_gpu_types();
+        if effective_gpus.is_empty() {
             return Err(AppError::InvalidConfig(
-                "instance_type cannot be empty".to_string(),
+                "No GPU types configured. Specify either instance_type or gpu_types.".to_string(),
             ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for gpu in &effective_gpus {
+            if gpu.trim().is_empty() {
+                return Err(AppError::InvalidConfig(
+                    "GPU type name cannot be empty".to_string(),
+                ));
+            }
+            if !seen.insert(gpu.clone()) {
+                return Err(AppError::InvalidConfig(format!(
+                    "Duplicate GPU type entry in config: {}",
+                    gpu
+                )));
+            }
         }
         if self.nemotron.api_key.expose_secret().trim().is_empty() {
             return Err(AppError::InvalidConfig(
@@ -218,6 +255,16 @@ impl Config {
         if self.timeouts.nemotron_poll_interval_seconds == 0 {
             return Err(AppError::InvalidConfig(
                 "nemotron_poll_interval_seconds must be positive".to_string(),
+            ));
+        }
+        if self.timeouts.cleanup_timeout_seconds == 0 {
+            return Err(AppError::InvalidConfig(
+                "cleanup_timeout_seconds must be positive".to_string(),
+            ));
+        }
+        if self.timeouts.cleanup_poll_interval_seconds == 0 {
+            return Err(AppError::InvalidConfig(
+                "cleanup_poll_interval_seconds must be positive".to_string(),
             ));
         }
 

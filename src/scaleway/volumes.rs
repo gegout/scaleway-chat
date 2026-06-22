@@ -173,4 +173,38 @@ impl ScalewayClient {
         let path = format!("/block/v1/zones/{}/volumes/{}", self.zone, volume_id);
         self.request(Method::GET, &path, |req| req).await
     }
+
+    pub async fn verify_volume_deleted(
+        &self,
+        volume_id: &str,
+        timeout: Duration,
+        interval: Duration,
+    ) -> Result<()> {
+        let start = Instant::now();
+        let path = format!("/block/v1/zones/{}/volumes/{}", self.zone, volume_id);
+        loop {
+            if start.elapsed() > timeout {
+                return Err(AppError::CleanupIncomplete(format!(
+                    "Timeout waiting for volume {} deletion verification",
+                    volume_id
+                )));
+            }
+            match self
+                .request::<Volume, _>(Method::GET, &path, |req| req)
+                .await
+            {
+                Ok(_) => {
+                    // Still exists, wait and poll
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if err_str.contains("404") || err_str.contains("not_found") {
+                        info!("[Cleanup] Volume deletion verified.");
+                        return Ok(());
+                    }
+                }
+            }
+            tokio::time::sleep(interval).await;
+        }
+    }
 }

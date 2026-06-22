@@ -32,7 +32,19 @@
 pub mod cli;
 pub mod config;
 pub mod error;
+pub mod hal;
 pub mod logging;
 pub mod nemotron;
 pub mod scaleway;
 pub mod state;
+
+/// Trait to report progress updates during long-running tasks.
+pub trait ProgressReporter: Send + Sync {
+    fn report(&self, percent: u32, message: &str);
+}
+
+/// A no-op implementation of ProgressReporter for tests and CLI mode.
+pub struct NoopProgress;
+impl ProgressReporter for NoopProgress {
+    fn report(&self, _percent: u32, _message: &str) {}
+}

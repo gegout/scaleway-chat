@@ -27,8 +27,7 @@ use crate::scaleway::client::ScalewayClient;
 use crate::scaleway::models::{AttachIpRequest, CreateIpRequest, InstanceIp, IpResponse};
 
 impl ScalewayClient {
-    /// Allocates a new flexible routed IPv4 address in the target zone.
-    pub async fn allocate_public_ip(&self) -> Result<IpResponse> {
+    pub async fn allocate_public_ip(&self, attempt_id: &str) -> Result<IpResponse> {
         info!("[Scaleway] Allocating a new public IPv4 address...");
 
         let path = format!("/instance/v1/zones/{}/ips", self.zone);
@@ -38,6 +37,7 @@ impl ScalewayClient {
             tags: vec![
                 "managed-by=scaleway-chat".to_string(),
                 "application=scaleway-chat".to_string(),
+                format!("attempt-id={}", attempt_id),
             ],
         };
 
@@ -140,6 +140,40 @@ impl ScalewayClient {
                     )))
                 }
             }
+        }
+    }
+
+    pub async fn verify_public_ip_deleted(
+        &self,
+        ip_id: &str,
+        timeout: std::time::Duration,
+        interval: std::time::Duration,
+    ) -> Result<()> {
+        let start = std::time::Instant::now();
+        let path = format!("/instance/v1/zones/{}/ips/{}", self.zone, ip_id);
+        loop {
+            if start.elapsed() > timeout {
+                return Err(AppError::CleanupIncomplete(format!(
+                    "Timeout waiting for public IP {} deletion verification",
+                    ip_id
+                )));
+            }
+            match self
+                .request::<IpResponse, _>(Method::GET, &path, |req| req)
+                .await
+            {
+                Ok(_) => {
+                    // Still exists, wait and poll
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if err_str.contains("404") || err_str.contains("not_found") {
+                        info!("[Cleanup] Public IP deletion verified.");
+                        return Ok(());
+                    }
+                }
+            }
+            tokio::time::sleep(interval).await;
         }
     }
 }

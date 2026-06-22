@@ -46,6 +46,55 @@ High-performance GPU instances like Scaleway’s `L40S-1-48G` are powerful machi
 
 ---
 
+## ⚡ GPU Fallback & Transactional Cleanup Policy
+
+To maximize provisioning success rate while strictly containing costs and preventing leaked billing resources, `scaleway-chat` implements a transactional GPU fallback orchestration algorithm.
+
+### 1. Ordered Fallback Candidates
+When starting a session in the target Availability Zone (predefined as `fr-par-2` to match the source snapshot), the application attempts to provision instances using the following ordered fallback list:
+1. `L40S-1-48G`
+2. `L40S-2-48G`
+3. `H100-1-80G`
+
+If the configuration specifies `instance_type` (for backward compatibility), it is internally mapped to a single-element list. If `gpu_types` is specified, it takes precedence.
+
+### 2. Same-Zone Constraint (`fr-par-2`)
+Because the source snapshot is zone-bound and cannot be automatically copied or replaced, all fallback attempts strictly run within `fr-par-2`. If no compatible or available GPU can be successfully provisioned in `fr-par-2`, the process terminates.
+
+### 3. No-Zombie Guarantee & Verified Deletion
+To prevent orphaned resources from incurring ongoing costs, the application treats every provisioning attempt as a single transaction:
+* **Creation Order**: The Instance is created directly from the snapshot, the generated boot volume ID is discovered, the instance is powered on, and only *after* it reaches the `running` state is a temporary public IP allocated and attached.
+* **Verified Cleanup**: If any failure occurs during this flow (e.g. `out_of_stock` errors, power-on failures, connection timeouts, driver incompatibilities, or user interruption like `Ctrl+C`), the orchestrator halts, deletes all created resources (Instance, restored Boot Volume, temporary IP), and polls their respective GET endpoints until they return HTTP 404 (Not Found).
+* **Cleanup Failures**: If cleanup cannot be verified within the timeout limit (`cleanup_timeout_seconds`), the application preserves the state file, prints the remaining active resource IDs, exits with a non-zero status, and asks for manual intervention. No further GPU fallback is attempted.
+
+### 4. Product Offerings vs. Live Capacity
+Before attempting a GPU candidate, the app queries the Scaleway Instance Products API to validate compatibility (supported volume types, architecture, minimum size constraint, and zone availability). However, *offering* a product in a zone does not guarantee live capacity. Live capacity is only confirmed when the Instance is successfully created and powered on.
+
+### 5. Multi-GPU & Runtime Compatibility Caveats
+* **L40S-2-48G**: This instance type provides two physical GPUs. The booted Canonical Inference Snap might only configure and utilize a single GPU. `scaleway-chat` does not automatically modify the snap configuration.
+* **H100-1-80G Guest Runtime**: Even if the H100 satisfies all infrastructure and volume checks, the NVIDIA driver or CUDA version inside the snapshot may not support the H100 GPU. The application verifies guest compatibility by checking that the Nemotron `/v1/models` endpoint becomes ready. If it fails, the instance is torn down, and the failure is classified as guest-runtime incompatible.
+
+### 6. Startup Reconciliation
+If the application starts up and finds a local state file representing an incomplete, powered-off, stopped, or failed provisioning session from a previous run, it will:
+1. Identify all remaining resources in that state.
+2. Trigger the transactional cleanup to destroy them.
+3. Verify their deletion.
+4. Restart the ordered fallback algorithm from the first GPU type.
+It will **never** adopt a powered-off or stalled instance for a new session.
+
+### 7. Predefined Snapshot Safety
+The golden source snapshot is immutable. The application:
+* Contains no implementation or calls to the Scaleway snapshot deletion endpoint.
+* Contains runtime assertions that reject deleting any resource sharing the ID of the source snapshot.
+* Re-verifies that the source snapshot exists and remains ready after every cleanup cycle.
+
+### 8. Billing Implications
+* **Failed Provisioning**: Automatically cleaned up immediately; no billing resources are left behind.
+* **Exit (`/exit`)**: The running instance is preserved by choice so the user can resume later. A warning message displays active billing implications.
+* **Kill (`/kill`)**: Shuts down the REPL and triggers immediate verified teardown of all active session resources.
+
+---
+
 ## 🛠 Architecture & Implementation
 
 `scaleway-chat` is designed with a modular, library-first architecture (`src/lib.rs`), splitting the core orchestration engine from the interactive CLI entrypoint (`src/main.rs`).
@@ -111,16 +160,21 @@ Before running the application, prepare a configuration file in `~/.config/scale
 ```toml
 [scaleway]
 access_key = "SCWXXXXXXXXXXXXXXXXX"
-secret_key = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-project_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
-organization_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+secret_key = "REPLACE_WITH_SECRET"
+project_id = "REPLACE_WITH_PROJECT_UUID"
+organization_id = "REPLACE_WITH_ORGANIZATION_UUID"
 zone = "fr-par-2"
 
 [instance]
 name = "nemotron-l40s"
-instance_type = "L40S-1-48G"
 snapshot_id = "1b552e81-401d-4c15-b0b2-3c89e2d46c28"
 public_ip = "new"
+
+gpu_types = [
+    "L40S-1-48G",
+    "L40S-2-48G",
+    "H100-1-80G",
+]
 
 [nemotron]
 port = 8330
@@ -133,11 +187,10 @@ system_prompt = "You are a helpful, concise assistant."
 [timeouts]
 instance_creation_seconds = 1200
 instance_poll_interval_seconds = 10
+cleanup_timeout_seconds = 300
+cleanup_poll_interval_seconds = 5
 nemotron_startup_seconds = 1200
 nemotron_poll_interval_seconds = 10
-
-[logging]
-verbose = true
 ```
 
 ---
@@ -366,6 +419,91 @@ cargo test
      9. Verification of attachment after execution.
      10. Application resume from persisted state.
      11. No duplicate resource creation.
+
+---
+
+## 🤖 HAL Integration
+
+`scaleway-chat` supports a non-interactive subprocess protocol specifically designed to integrate with the `hal-ecosystem` bot.
+
+### Architecture
+
+```
+Telegram User ──> HAL Bot ──(Subprocess stdin/stdout)──> scaleway-chat hal
+```
+
+When HAL runs in stdio transport mode, it executes:
+```bash
+scaleway-chat hal
+```
+It writes exactly one JSON request line to standard input, parses progress and final responses from standard output as NDJSON, and terminates. All logging, telemetry, and error diagnostics are safely written to `stderr` to keep `stdout` pure.
+
+### Supported HAL Commands
+
+- **`scaleway`**:
+  - Joins the arguments with spaces to construct the query prompt.
+  - Resolves, provisions, or adopts the required Scaleway resources (flexible IP, instance booted directly from snapshot).
+  - Waits for OS boot and model readiness (Canonical Inference Snap status).
+  - Sends a single inference request to the model, streams the response internally, and outputs a single final HTML event containing the complete answer.
+  - Exits *without* deleting GPU resources. Emits a billing notice that the GPU remains active.
+- **`scaleway_start`**:
+  - Provisions or resumes GPU resources and waits until the inference endpoint is reachable.
+  - Outputs a summary of instance name, power state, public IP, model name, and a billing warning.
+  - Does not send an inference prompt.
+- **`scaleway_status`**:
+  - Concisely queries the status of the Golden Snapshot, GPU Instance, Boot Volume, Flexible IP, and Model readiness without provisioning or deleting anything.
+- **`scaleway_kill`**:
+  - Requires exactly one argument: `KILL`.
+  - Stops and deletes the GPU instance, restored volume, and flexible IP, clearing local session state on successful teardown.
+  - Strictly preserves the Golden Snapshot.
+- **`scaleway_help`**:
+  - Returns concise HTML-safe Telegram help info.
+
+### NDJSON Protocol Examples
+
+#### Request (stdin):
+```json
+{"request_id": "97e68bc6-9289-4d6f-870f-90e87dcd3e44", "command": "scaleway", "arguments": ["Explain", "Juju", "controllers"]}
+```
+
+#### Progress Event (stdout):
+```json
+{"type":"progress","request_id":"97e68bc6-9289-4d6f-870f-90e87dcd3e44","percent":30,"message":"Validating source snapshot...","format":"html"}
+```
+
+#### Final Event (stdout):
+```json
+{"type":"final","request_id":"97e68bc6-9289-4d6f-870f-90e87dcd3e44","format":"html","message":"Juju controllers manage... \n\n⚠️ <b>Billing Notice:</b> The GPU Instance remains active and will continue billing. Use <code>/scaleway_kill KILL</code> to terminate it when you are finished.","trusted_html":true}
+```
+
+#### Error Event (stdout):
+```json
+{"type":"error","request_id":"97e68bc6-9289-4d6f-870f-90e87dcd3e44","reason":"Capacity Unavailable","technical_details":"Out of L40S-1-48G instances in fr-par-2","suggested_action":"Please retry later or check Scaleway Console."}
+```
+
+### Installation & Deployment
+
+To build and deploy the application and configure the launcher for HAL:
+
+```bash
+# 1. Clone and compile release binary
+git clone https://github.com/gegout/scaleway-chat
+cd scaleway-chat
+cargo build --release
+
+# 2. Install executable
+mkdir -p /home/cgegout/bin
+install -m 755 target/release/scaleway-chat /home/cgegout/bin/scaleway-chat
+
+# 3. Create launcher script
+cat > /home/cgegout/bin/scaleway-chat-hal <<'EOF'
+#!/bin/sh
+exec "$HOME/bin/scaleway-chat" hal
+EOF
+
+# 4. Make launcher executable
+chmod 755 /home/cgegout/bin/scaleway-chat-hal
+```
 
 ---
 

@@ -25,7 +25,7 @@ use std::path::PathBuf;
 #[derive(Parser, Debug)]
 #[command(
     name = "scaleway-chat",
-    version = "0.1.0",
+    version = "0.1.1",
     about = "GPU instance provisioning and interactive Nemotron chat application"
 )]
 pub struct Cli {
@@ -58,4 +58,7 @@ pub enum Commands {
 
     #[command(about = "Run live integration tests against the Scaleway API")]
     TestIntegration,
+
+    #[command(about = "Run in non-interactive HAL subprocess mode")]
+    Hal,
 }

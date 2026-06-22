@@ -101,6 +101,57 @@ pub enum AppError {
 
     #[error("UUID processing error: {0}")]
     Uuid(#[from] uuid::Error),
+
+    #[error("GPU capacity out of stock: {gpu_type} in {zone}")]
+    OutOfStock { gpu_type: String, zone: String },
+
+    #[error("Product not offered: {gpu_type} in {zone}")]
+    ProductNotOffered { gpu_type: String, zone: String },
+
+    #[error("Incompatible volume for {gpu_type}: {reason}")]
+    IncompatibleVolume { gpu_type: String, reason: String },
+
+    #[error("Guest runtime incompatible on {gpu_type}: {reason}")]
+    GuestRuntimeIncompatible { gpu_type: String, reason: String },
+
+    #[error("No compatible GPU available in {zone}. Attempted: {attempted:?}")]
+    NoCompatibleGpuAvailable {
+        zone: String,
+        attempted: Vec<String>,
+    },
+}
+
+impl AppError {
+    pub fn is_out_of_stock(&self) -> bool {
+        match self {
+            AppError::CapacityUnavailable(_) => true,
+            AppError::OutOfStock { .. } => true,
+            AppError::ApiError(msg) | AppError::InstanceCreationFailed(msg) => {
+                let msg_lower = msg.to_lowercase();
+                msg_lower.contains("out_of_stock")
+                    || msg_lower.contains("412") && msg_lower.contains("stock")
+            }
+            _ => false,
+        }
+    }
+
+    pub fn should_try_next_gpu(&self) -> bool {
+        match self {
+            AppError::OutOfStock { .. } => true,
+            AppError::CapacityUnavailable(_) => true,
+            AppError::InstanceTypeUnavailable(_) => true,
+            AppError::ProductNotOffered { .. } => true,
+            AppError::IncompatibleVolume { .. } => true,
+            AppError::GuestRuntimeIncompatible { .. } => true,
+            AppError::InstanceCreationFailed(msg) => {
+                let msg_lower = msg.to_lowercase();
+                msg_lower.contains("out_of_stock")
+                    || msg_lower.contains("stock")
+                    || msg_lower.contains("capacity")
+            }
+            _ => false,
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, AppError>;

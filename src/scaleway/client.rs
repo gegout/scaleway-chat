@@ -40,6 +40,8 @@ pub struct ScalewayClient {
 
 impl ScalewayClient {
     pub fn new(config: &Config) -> Self {
+        let base_url =
+            std::env::var("SCW_API_URL").unwrap_or_else(|_| "https://api.scaleway.com".to_string());
         Self {
             http_client: Client::builder()
                 .timeout(Duration::from_secs(30))
@@ -49,7 +51,7 @@ impl ScalewayClient {
             project_id: config.scaleway.project_id.clone(),
             organization_id: config.scaleway.organization_id.clone(),
             zone: config.scaleway.zone.clone(),
-            base_url: "https://api.scaleway.com".to_string(),
+            base_url,
         }
     }
 
@@ -211,7 +213,9 @@ impl ScalewayClient {
             StatusCode::UNAUTHORIZED => AppError::AuthenticationFailed(error_msg),
             StatusCode::FORBIDDEN => AppError::PermissionDenied(error_msg),
             StatusCode::NOT_FOUND => AppError::InvalidConfig(error_msg),
-            StatusCode::CONFLICT => AppError::CapacityUnavailable(error_msg),
+            StatusCode::CONFLICT | StatusCode::PRECONDITION_FAILED => {
+                AppError::CapacityUnavailable(error_msg)
+            }
             _ => AppError::ApiError(error_msg),
         }
     }

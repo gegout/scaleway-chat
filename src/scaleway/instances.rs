@@ -53,20 +53,18 @@ impl ScalewayClient {
         }
 
         info!(
-            "[Scaleway] Instance type {} is supported in zone.",
-            instance_type
+            "Instance type {} is offered in {}. Actual capacity will be confirmed during creation or power-on.",
+            instance_type, self.zone
         );
         Ok(())
     }
 
-    /// Creates a GPU virtual server directly from the golden snapshot ID.
-    /// This defines a custom volumes map mapping "0" to `SnapshotBootVolume` with `base_snapshot`.
-    /// The API automatically spawns and registers a block boot volume on server creation.
     pub async fn create_instance(
         &self,
         name: &str,
         instance_type: &str,
         snapshot_id: &str,
+        attempt_id: &str,
     ) -> Result<Server> {
         info!(
             "[Scaleway] Creating GPU Instance {} directly from snapshot...",
@@ -100,6 +98,9 @@ impl ScalewayClient {
             tags: vec![
                 "managed-by=scaleway-chat".to_string(),
                 "application=scaleway-chat".to_string(),
+                format!("attempt-id={}", attempt_id),
+                format!("gpu-type={}", instance_type),
+                format!("snapshot-id={}", snapshot_id),
             ],
         };
 
@@ -178,6 +179,27 @@ impl ScalewayClient {
         timeout_secs: u64,
         poll_interval_secs: u64,
     ) -> Result<Server> {
+        self.wait_for_instance_running_with_progress(
+            server_id,
+            timeout_secs,
+            poll_interval_secs,
+            |_, _| {},
+        )
+        .await
+    }
+
+    /// Periodically queries the server GET endpoint to wait until the instance
+    /// status is "running", reporting progress percentages on each loop.
+    pub async fn wait_for_instance_running_with_progress<F>(
+        &self,
+        server_id: &str,
+        timeout_secs: u64,
+        poll_interval_secs: u64,
+        progress: F,
+    ) -> Result<Server>
+    where
+        F: Fn(u32, &str),
+    {
         let start = Instant::now();
         let timeout = Duration::from_secs(timeout_secs);
         let interval = Duration::from_secs(poll_interval_secs);
@@ -195,6 +217,13 @@ impl ScalewayClient {
                 Ok(resp) => {
                     let server = resp.server;
                     info!("[Scaleway] Instance state: {}", server.state);
+                    progress(
+                        70,
+                        &format!(
+                            "Waiting for the operating system to boot (state: {})",
+                            server.state
+                        ),
+                    );
                     if server.state == "running" {
                         return Ok(server);
                     }
@@ -206,6 +235,10 @@ impl ScalewayClient {
                 }
                 Err(e) => {
                     tracing::warn!("Failed to query server status: {}. Retrying...", e);
+                    progress(
+                        70,
+                        "Waiting for the operating system to boot (GET request failed)...",
+                    );
                 }
             }
 
@@ -304,5 +337,39 @@ impl ScalewayClient {
         let path = format!("/instance/v1/zones/{}/servers/{}", self.zone, server_id);
         let resp: ServerResponse = self.request(Method::GET, &path, |req| req).await?;
         Ok(resp.server)
+    }
+
+    pub async fn verify_instance_deleted(
+        &self,
+        server_id: &str,
+        timeout: Duration,
+        interval: Duration,
+    ) -> Result<()> {
+        let start = Instant::now();
+        let path = format!("/instance/v1/zones/{}/servers/{}", self.zone, server_id);
+        loop {
+            if start.elapsed() > timeout {
+                return Err(AppError::CleanupIncomplete(format!(
+                    "Timeout waiting for instance {} deletion verification",
+                    server_id
+                )));
+            }
+            match self
+                .request::<ServerResponse, _>(Method::GET, &path, |req| req)
+                .await
+            {
+                Ok(_) => {
+                    // Still exists, wait and poll
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if err_str.contains("404") || err_str.contains("not_found") {
+                        info!("[Cleanup] Instance deletion verified.");
+                        return Ok(());
+                    }
+                }
+            }
+            tokio::time::sleep(interval).await;
+        }
     }
 }

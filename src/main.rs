@@ -30,14 +30,16 @@ use scaleway_chat::logging;
 use scaleway_chat::nemotron::{chat::ChatAction, NemotronClient};
 use scaleway_chat::scaleway::ScalewayClient;
 use scaleway_chat::state::State;
+use scaleway_chat::NoopProgress;
 
 #[tokio::main]
 async fn main() {
     // Parse command line arguments using clap
     let args = Cli::parse();
 
-    // Initialize the console logger. If verbose is enabled, debug-level logs will print.
-    logging::init(args.verbose);
+    // Initialize logging to stderr if running the hal command
+    let to_stderr = matches!(args.command, Some(Commands::Hal));
+    logging::init(args.verbose, to_stderr);
 
     // Load the configuration file. If a path is provided with --config, use it;
     // otherwise, fallback to the default location (~/.config/scaleway-chat/config.toml).
@@ -70,10 +72,14 @@ async fn main() {
         Commands::Status => show_status(&client, &config).await,
         Commands::Kill => run_kill(&client, &config).await,
         Commands::Run => run_flow(&client, &config).await,
+        Commands::Hal => scaleway_chat::hal::run_hal_mode(&client, &config).await,
     };
 
     if let Err(e) = run_result {
         error!("Execution failed: {}", e);
+        if let Ok(Some(state)) = State::load_default() {
+            report_remaining_resources(&state);
+        }
         std::process::exit(1);
     }
 }
@@ -91,9 +97,9 @@ async fn validate_config(client: &ScalewayClient, config: &Config) -> Result<()>
         snap.size / 1_000_000_000
     );
 
-    client
-        .validate_instance_type_available(&config.instance.instance_type)
-        .await?;
+    for gpu_type in &config.instance.effective_gpu_types() {
+        client.validate_instance_type_available(gpu_type).await?;
+    }
 
     info!("Configuration and remote connection checks validated successfully.");
     Ok(())
@@ -106,14 +112,14 @@ async fn run_live_integration_test(client: &ScalewayClient, config: &Config) -> 
     client.validate_auth_and_project().await?;
     info!("[Integration Test] Authentication and project access are valid!");
 
-    info!(
-        "[Integration Test] 2. Checking instance type '{}' availability...",
-        config.instance.instance_type
-    );
-    client
-        .validate_instance_type_available(&config.instance.instance_type)
-        .await?;
-    info!("[Integration Test] Instance type is supported in zone!");
+    for gpu_type in &config.instance.effective_gpu_types() {
+        info!(
+            "[Integration Test] 2. Checking instance type '{}' availability...",
+            gpu_type
+        );
+        client.validate_instance_type_available(gpu_type).await?;
+    }
+    info!("[Integration Test] Instance types are supported in zone!");
 
     info!(
         "[Integration Test] 3. Fetching and validating snapshot '{}'...",
@@ -140,7 +146,10 @@ async fn show_status(client: &ScalewayClient, config: &Config) -> Result<()> {
     println!("Zone: {}", config.scaleway.zone);
     println!("Project ID: {}", config.scaleway.project_id);
     println!("Target Instance Name: {}", config.instance.name);
-    println!("Target Instance Type: {}", config.instance.instance_type);
+    println!(
+        "Target Instance Types: {:?}",
+        config.instance.effective_gpu_types()
+    );
     println!("Source Snapshot ID: {}", config.instance.snapshot_id);
 
     println!("\n--- Local State File ---");
@@ -267,17 +276,24 @@ async fn run_flow(client: &ScalewayClient, config: &Config) -> Result<()> {
         ),
     };
 
-    // Capture Ctrl-C signal to safely output tracked resource IDs on sudden exit
+    // Capture Ctrl-C signal to safely trigger cleanup on sudden exit
     let ctrl_c_signal = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c_signal);
 
-    // 2. Provision resources (Server, boot volume, allocated IP, IP attachment, power on)
+    // 2. Provision resources (Server, boot volume, allocated IP, IP attachment, power on, Nemotron wait)
     // while listening for Ctrl-C termination.
     let provision_res = tokio::select! {
-        res = client.provision_resources(config, &mut state) => res,
+        res = client.ensure_ready(config, &mut state, &NoopProgress) => res,
         _ = &mut ctrl_c_signal => {
-            eprintln!("\n[Signal] Provisioning interrupted by Ctrl+C.");
-            report_remaining_resources(&state);
+            eprintln!("\n[Signal] Provisioning interrupted by Ctrl+C. Initiating automatic cleanup...");
+            match client.cleanup_failed_attempt(config, &mut state).await {
+                Ok(_) => {
+                    eprintln!("[Cleanup] Cleanup complete. Source snapshot preserved.");
+                }
+                Err(e) => {
+                    eprintln!("[Cleanup] Cleanup incomplete: {}. Manual intervention required.", e);
+                }
+            }
             std::process::exit(130);
         }
     };
@@ -290,30 +306,15 @@ async fn run_flow(client: &ScalewayClient, config: &Config) -> Result<()> {
         config.nemotron.port,
         config.nemotron.api_key.clone(),
         config.nemotron.model.clone(),
+        config.timeouts.inference_timeout_seconds,
     );
-
-    // 4. Poll Nemotron /v1/models endpoint until the inference server returns HTTP 200,
-    // indicating that model weight loading is complete and the model is ready.
-    let nemotron_wait_res = tokio::select! {
-        res = nemotron_client.wait_for_ready(
-            config.timeouts.nemotron_startup_seconds,
-            config.timeouts.nemotron_poll_interval_seconds,
-        ) => res,
-        _ = tokio::signal::ctrl_c() => {
-            eprintln!("\n[Signal] Startup wait interrupted by Ctrl+C.");
-            report_remaining_resources(&state);
-            std::process::exit(130);
-        }
-    };
-
-    nemotron_wait_res?;
 
     let state_report = format!(
         "Instance ID: {:?}\nVolume ID: {:?}\nPublic IP: {}",
         state.instance_id, state.volume_id, server_ip
     );
 
-    // 5. Run the interactive chat REPL.
+    // 4. Run the interactive chat REPL.
     // Handles /clear, /status, /exit (leave running), and /kill (destroy resources).
     match scaleway_chat::nemotron::chat::start_chat(&nemotron_client, config, &state_report).await?
     {
